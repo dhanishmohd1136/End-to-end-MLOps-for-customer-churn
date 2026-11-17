@@ -1,16 +1,21 @@
 
+import time
 import mlflow
 import pandas as pd
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 from mlflow import MlflowClient
 from mlflow.exceptions import MlflowException
 
+from prometheus_client import (
+    Counter,
+    Histogram,
+    generate_latest,
+    CONTENT_TYPE_LATEST
+)
 
-# ==========================================
-# CONFIGURATION
-# ==========================================
+
 
 MODEL_NAME = "ChurnModel"
 
@@ -18,14 +23,48 @@ client = MlflowClient()
 
 app = FastAPI(
     title="Customer Churn Prediction API",
-    description="MLflow Model Prediction and Rollback API",
+    description="MLflow Prediction, Rollback and Monitoring API",
     version="1.0.0"
 )
 
 
-# ==========================================
-# INPUT VALIDATION
-# ==========================================
+
+
+API_REQUESTS = Counter(
+    "churnops_api_requests_total",
+    "Total API requests",
+    ["method", "endpoint", "status"]
+)
+
+API_LATENCY = Histogram(
+    "churnops_api_request_duration_seconds",
+    "API request processing duration",
+    ["endpoint"]
+)
+
+PREDICTIONS_TOTAL = Counter(
+    "churnops_predictions_total",
+    "Total successful predictions",
+    ["prediction"]
+)
+
+PREDICTION_ERRORS = Counter(
+    "churnops_prediction_errors_total",
+    "Total failed predictions"
+)
+
+ROLLBACK_TOTAL = Counter(
+    "churnops_rollbacks_total",
+    "Total successful rollback operations"
+)
+
+ROLLBACK_ERRORS = Counter(
+    "churnops_rollback_errors_total",
+    "Total failed rollback operations"
+)
+
+
+
 
 class CustomerFeatures(BaseModel):
 
@@ -45,21 +84,47 @@ class RollbackRequest(BaseModel):
     version: int = Field(gt=0)
 
 
-# ==========================================
-# PREDICTION ENDPOINT
-# ==========================================
+
+
+@app.middleware("http")
+async def monitor_requests(request: Request, call_next):
+
+    start_time = time.perf_counter()
+
+    response = await call_next(request)
+
+    duration = time.perf_counter() - start_time
+
+    endpoint = request.url.path
+
+    if endpoint != "/metrics":
+
+        API_REQUESTS.labels(
+            method=request.method,
+            endpoint=endpoint,
+            status=str(response.status_code)
+        ).inc()
+
+        API_LATENCY.labels(
+            endpoint=endpoint
+        ).observe(duration)
+
+    return response
+
+
+
 
 @app.post("/predict", tags=["Prediction"])
 def predict(request: PredictionRequest):
 
     try:
 
-        # Load champion model from MLflow
+        # Load champion model
         model = mlflow.pyfunc.load_model(
             f"models:/{MODEL_NAME}@champion"
         )
 
-        # Convert input into DataFrame
+        # Convert input to DataFrame
         data = pd.DataFrame([
             request.features.model_dump()
         ])
@@ -68,6 +133,11 @@ def predict(request: PredictionRequest):
         prediction = model.predict(data)
 
         result = int(prediction[0])
+
+        # Record prediction metric
+        PREDICTIONS_TOTAL.labels(
+            prediction=str(result)
+        ).inc()
 
         return {
             "model_name": MODEL_NAME,
@@ -78,14 +148,9 @@ def predict(request: PredictionRequest):
             )
         }
 
-    except MlflowException as e:
-
-        raise HTTPException(
-            status_code=503,
-            detail=f"MLflow model error: {str(e)}"
-        )
-
     except Exception as e:
+
+        PREDICTION_ERRORS.inc()
 
         raise HTTPException(
             status_code=500,
@@ -93,9 +158,7 @@ def predict(request: PredictionRequest):
         )
 
 
-# ==========================================
-# ROLLBACK ENDPOINT
-# ==========================================
+
 
 @app.post("/rollback", tags=["Model Management"])
 def rollback(request: RollbackRequest):
@@ -115,6 +178,9 @@ def rollback(request: RollbackRequest):
             version=str(request.version)
         )
 
+        # Record successful rollback
+        ROLLBACK_TOTAL.inc()
+
         return {
             "status": "success",
             "message": "Model rollback successful",
@@ -122,19 +188,28 @@ def rollback(request: RollbackRequest):
             "champion_version": request.version
         }
 
-    except MlflowException as e:
-
-        raise HTTPException(
-            status_code=404,
-            detail=f"MLflow error: {str(e)}"
-        )
-
     except Exception as e:
 
+        ROLLBACK_ERRORS.inc()
+
         raise HTTPException(
-            status_code=500,
-            detail=str(e)
+            status_code=400,
+            detail=f"Rollback failed: {str(e)}"
         )
+
+
+
+
+@app.get("/metrics", include_in_schema=False)
+def prometheus_metrics():
+
+    return Response(
+        content=generate_latest(),
+        headers={
+            "Content-Type": CONTENT_TYPE_LATEST
+        }
+    )
+
 
 
 
@@ -146,7 +221,7 @@ def home():
         "status": "running",
         "endpoints": [
             "POST /predict",
-            "POST /rollback"
-        ],
-        "documentation": "/docs"
+            "POST /rollback",
+            "GET /metrics"
+        ]
     }
